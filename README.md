@@ -47,3 +47,4 @@ There are various game level hacks necessary to stop blockages on streaming for 
 - Optional Launch Timeout
 - Set Game to Foreground
 - Kill Game before Exit if Closing does not work
+- Close handler is now async (fixes never able to gracefully close game)

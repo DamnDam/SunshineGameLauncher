@@ -11,6 +11,7 @@ namespace SunshineLauncher
     {
         private MainWindow? mainWindow;
         private Process? gameProcess;
+        private bool exitRequested = false;
 
         private string ExeName = string.Empty;
         private int TimeoutSeconds = 30;
@@ -32,73 +33,135 @@ namespace SunshineLauncher
             CTRL_SHUTDOWN_EVENT = 6
         }
 
-        private bool HandleConsoleControl(CtrlType sig)
+        private async Task<bool> WaitForGameExit(int timeoutMilliseconds)
         {
-            Trace.WriteLine("Exiting game to external CTRL-C, or process kill, or shutdown");
+            if (gameProcess == null)
+            {
+                Trace.WriteLine("No game process to wait for.");
+                return true;
+            }
 
+            try
+            {
+                gameProcess.Refresh();
+                Trace.WriteLine($"Waiting for game process '{gameProcess.ProcessName}' (ID {gameProcess.Id}) to exit...");
+                return await Task.Run(() =>
+                {
+                    return gameProcess.WaitForExit(timeoutMilliseconds);
+                });
+
+            }
+            catch (InvalidOperationException)
+            {
+                Trace.WriteLine("Game process has already exited or is inaccessible.");
+            }
+            return true;
+        }
+
+        private async Task HandleClosing(CtrlType sig)
+        {
+            exitRequested = true;
             if (gameProcess == null)
             {
                 Trace.WriteLine("No game process to clean up.");
-                return true;
+                return;
             }
-            Trace.WriteLine($"Game process '{gameProcess.ProcessName}' with ID {gameProcess.Id} is being cleaned up.");
 
-            // Close the main window of the game process if it exists
-            if (gameProcess.MainWindowHandle != IntPtr.Zero)
+            try
             {
-                try
+                gameProcess.Refresh();
+                if (gameProcess.HasExited)
                 {
-                    Trace.WriteLine($"Attempting to close main window of game process '{gameProcess.ProcessName}' with ID {gameProcess.Id}");
-                    if (!SetForegroundWindow(gameProcess.MainWindowHandle))
+                    Trace.WriteLine($"Game process has already exited.");
+                    return;
+                }
+
+                Trace.WriteLine($"Cleaning up game process '{gameProcess.ProcessName}' (ID {gameProcess.Id})...");
+
+                if (gameProcess.MainWindowHandle != IntPtr.Zero)
+                {
+                    try
                     {
-                        Trace.WriteLine($"Failed to set foreground window for process '{gameProcess.ProcessName}' with ID {gameProcess.Id}");
+                        Trace.WriteLine($"Attempting to close main window (CloseMainWindow)...");
+                        // Set foreground window
+                        SetForegroundWindow(gameProcess.MainWindowHandle);
+                        await Task.Delay(10);
+                        // Attempt to close the main window gracefully
+                        gameProcess.CloseMainWindow();
                     }
-                    gameProcess.CloseMainWindow();
-                    gameProcess.WaitForExit(4000); // Wait for the main window to close, with a timeout of 4 seconds
+                    catch (Exception ex)
+                    {
+                        Trace.WriteLine($"Failed to close main window: {ex.Message}");
+                    }
                 }
-                catch (Exception ex)
+
+                if (await WaitForGameExit(3000))
                 {
-                    Trace.WriteLine($"Failed to close main window: {ex.Message}");
+                    Trace.WriteLine($"Game process '{gameProcess.ProcessName}' (ID {gameProcess.Id}) exited gracefully.");
+                }
+                else
+                {
+                    try
+                    {
+                        Trace.WriteLine($"Attempting to kill process...");
+                        gameProcess.Kill();
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace.WriteLine($"Failed to kill process: {ex.Message}");
+                    }
+                    if (await WaitForGameExit(500))
+                    {
+                        Trace.WriteLine($"Game process (ID {gameProcess.Id}) killed.");
+                    }
+                    else
+                    {
+                        Trace.WriteLine($"Game process (ID {gameProcess.Id}) did not exit after kill attempt.");
+                    }
                 }
             }
-
-            // Kill the game process if it is still running
-            if (!gameProcess.HasExited)
+            catch (InvalidOperationException)
             {
-                try
-                {
-                    Trace.WriteLine($"Attempting to kill game process '{gameProcess.ProcessName}' with ID {gameProcess.Id}");
-                    gameProcess.Kill();
-                    gameProcess.WaitForExit(500);
-                    Trace.WriteLine($"Game process '{gameProcess.ProcessName}' with ID {gameProcess.Id} has been killed.");
-                }
-                catch (Exception ex)
-                {
-                    Trace.WriteLine($"Failed to kill game process: {ex.Message}");
-                }
+                Trace.WriteLine("Game process has already exited or is inaccessible.");
             }
-
-            Trace.WriteLine("Cleanup complete");
-
-            //shutdown right away so there are no lingering threads
-            Environment.Exit(0);
-            return true;
+            catch (Exception ex)
+            {
+                Trace.WriteLine($"Unexpected error during cleanup: {ex.Message}");
+            }
         }
+
 
         protected override void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);
-            var handlerDelegate = new EventHandler(this.HandleConsoleControl);
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            Trace.WriteLine($"Monitor PID: {Process.GetCurrentProcess().Id}");
+
+            var handlerDelegate = new EventHandler(
+                (sig) =>
+                {
+                    Trace.WriteLine($"Received signal: {sig}");
+                    _ = HandleClosing(sig);
+                    Shutdown();
+                    return true; // Indicate that we handled the signal
+                }
+            );
             SetConsoleCtrlHandler(handlerDelegate, true);
 
             ParseAndLaunch(e);
 
             mainWindow = new MainWindow();
-            Application.Current.MainWindow = mainWindow;
+            Current.MainWindow = mainWindow;
             mainWindow.WindowState = WindowState.Maximized;
             mainWindow.WindowStyle = WindowStyle.None;
             mainWindow.Topmost = true;
             mainWindow.Show();
+            mainWindow.Closed += async (s, args) =>
+            {
+                Trace.WriteLine("Event: MainWindow closed");
+                await HandleClosing(CtrlType.CTRL_CLOSE_EVENT);
+                Shutdown();
+            };
 
             // Start process/game monitoring in the background
             _ = MonitorGameProcessAsync();
@@ -109,7 +172,7 @@ namespace SunshineLauncher
             if (e.Args.Length < 1)
             {
                 Trace.WriteLine("No executable name provided. Exiting.");
-                System.Windows.MessageBox.Show("No executable name provided. Exiting. \nUsage: SunshineLauncher.exe <exe_name> [launch_command] [timeout_seconds]", "SunshineLauncher", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Error);
+                MessageBox.Show("No executable name provided. Exiting. \nUsage: SunshineLauncher.exe <exe_name> [launch_command] [timeout_seconds]", "SunshineLauncher", MessageBoxButton.OK, MessageBoxImage.Error);
                 Environment.Exit(1);
             }
             // Parse executable name
@@ -134,7 +197,7 @@ namespace SunshineLauncher
                 catch (Exception ex)
                 {
                     Trace.WriteLine($"Failed to launch game with command '{launchCommand}': {ex.Message}");
-                    System.Windows.MessageBox.Show($"Failed to launch game: {ex.Message}", "SunshineLauncher", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Error);
+                    MessageBox.Show($"Failed to launch game: {ex.Message}", "SunshineLauncher", MessageBoxButton.OK, MessageBoxImage.Error);
                     Environment.Exit(2);
                 }
             }
@@ -148,7 +211,7 @@ namespace SunshineLauncher
                 }
                 else
                 {
-                    System.Windows.MessageBox.Show($"Invalid timeout value '{e.Args[2]}'", "SunshineLauncher", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Warning);
+                    MessageBox.Show($"Invalid timeout value '{e.Args[2]}'", "SunshineLauncher", MessageBoxButton.OK, MessageBoxImage.Warning);
                     Environment.Exit(1);
                 }
             }
@@ -163,7 +226,7 @@ namespace SunshineLauncher
             Stopwatch sw = Stopwatch.StartNew();
 
             // Game start loop
-            while (sw.Elapsed.TotalSeconds <= TimeoutSeconds)
+            while (sw.Elapsed.TotalSeconds <= TimeoutSeconds && !exitRequested)
             {
                 Process? found = Process.GetProcessesByName(ExeName.Replace(".exe", "")).FirstOrDefault();
                 if (found != null)
@@ -171,9 +234,18 @@ namespace SunshineLauncher
                     if ((gameProcess != null && gameProcess.Id != found.Id) || gameProcess == null)
                     {
                         gameProcess = found;
+                        Trace.WriteLine($"Found game process '{ExeName}' with ID: {gameProcess.Id}");
+                        if (gameProcess.MainWindowHandle != IntPtr.Zero)
+                        {
+                            // Set the main window of the game process as the foreground window
+                            if (!SetForegroundWindow(gameProcess.MainWindowHandle))
+                            {
+                                Trace.WriteLine($"Failed to set foreground window for process '{ExeName}' with ID {gameProcess.Id}");
+                            }
+                        }
                     }
                 }
-                await Task.Delay(500); // Non-blocking sleep
+                await Task.Delay(1000);
             }
             if (gameProcess == null)
             {
@@ -182,6 +254,7 @@ namespace SunshineLauncher
             }
 
             Trace.WriteLine($"Monitoring game process '{ExeName}' with ID: {gameProcess.Id}");
+            Trace.WriteLine($"Game process started at: {gameProcess.StartTime}");
             // Try to set the main window of the game process as the foreground window
             try
             {
@@ -204,14 +277,32 @@ namespace SunshineLauncher
             }
 
             // Monitoring loop
-            await gameProcess.WaitForExitAsync();
-            Trace.WriteLine("Exiting application.");
+            while (!gameProcess.HasExited)
+            {
+                if (exitRequested)
+                {
+                    Trace.WriteLine("Exit requested, stop monitoring.");
+                    return;
+                }
+                try
+                {
+                    gameProcess.Refresh();
+                }
+                catch (InvalidOperationException)
+                {
+                    Trace.WriteLine($"Game process '{ExeName}' with ID {gameProcess.Id} has exited unexpectedly.");
+                    break;
+                }
+                await Task.Delay(1000);
+            }
+            Trace.WriteLine("End of monitoring.");
             await Task.Delay(3000);
             Shutdown();
         }
 
         protected override void OnExit(ExitEventArgs e)
         {
+            Trace.WriteLine("Exiting...");
             gameProcess?.Dispose();
             base.OnExit(e);
         }

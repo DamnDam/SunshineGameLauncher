@@ -11,7 +11,15 @@
             "preLaunchTask": "build",
             // If you have changed target frameworks, make sure to update the program path.
             "program": "${workspaceFolder}/bin/Debug/net9.0-windows/win-x64/SunshineLauncher.dll",
-            "args": [],
+            "args": [
+                "Deliver At All Costs",
+                "com.epicgames.launcher://apps/2ef976af17b74478a4b2938d54bb3db4%3Ac067dd3d76c24b5394970c54c7c587e5%3Afa5aa7e6c28c4c94aeac239eee700d5f?action=launch&silent=true",
+                "5"
+            ],
+            "logging": {
+                "moduleLoad": false,
+                "trace": true
+            },
             "cwd": "${workspaceFolder}",
             // For more information about the 'console' field, see https://aka.ms/VSCode-CS-LaunchJson-Console
             "console": "internalConsole",
